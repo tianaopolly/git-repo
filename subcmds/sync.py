@@ -32,6 +32,8 @@ import urllib.parse
 import urllib.request
 import xml.parsers.expat
 import xmlrpc.client
+import xml.etree.ElementTree as ET
+from . import jfrog
 
 
 try:
@@ -86,10 +88,6 @@ from wrapper import Wrapper
 _ONE_DAY_S = 24 * 60 * 60
 
 _REPO_ALLOW_SHALLOW = os.environ.get("REPO_ALLOW_SHALLOW")
-
-_BLOAT_PACK_COUNT_THRESHOLD = 10
-_BLOAT_SIZE_PACK_THRESHOLD_KB = 10 * 1024 * 1024  # 10 GiB in KiB
-_BLOAT_SIZE_GARBAGE_THRESHOLD_KB = 1 * 1024 * 1024  # 1 GiB in KiB
 
 logger = RepoLogger(__file__)
 
@@ -208,13 +206,14 @@ class _SyncResult(NamedTuple):
       relpath (str): The project's relative path from the repo client top.
       remote_fetched (bool): True if the remote was actually queried.
       fetch_success (bool): True if the fetch operation was successful.
-      fetch_errors (List[Exception]): The Exceptions from a failed fetch.
+      fetch_error (Optional[Exception]): The Exception from a failed fetch,
+          or None.
       fetch_start (Optional[float]): The time.time() when fetch started.
       fetch_finish (Optional[float]): The time.time() when fetch finished.
       checkout_success (bool): True if the checkout operation was
           successful.
-      checkout_errors (List[Exception]): The Exceptions from a failed
-          checkout.
+      checkout_error (Optional[Exception]): The Exception from a failed
+          checkout, or None.
       checkout_start (Optional[float]): The time.time() when checkout
           started.
       checkout_finish (Optional[float]): The time.time() when checkout
@@ -227,12 +226,12 @@ class _SyncResult(NamedTuple):
 
     remote_fetched: bool
     fetch_success: bool
-    fetch_errors: List[Exception]
+    fetch_error: Optional[Exception]
     fetch_start: Optional[float]
     fetch_finish: Optional[float]
 
     checkout_success: bool
-    checkout_errors: List[Exception]
+    checkout_error: Optional[Exception]
     checkout_start: Optional[float]
     checkout_finish: Optional[float]
 
@@ -277,9 +276,7 @@ class ManifestInterruptError(RepoError):
 class TeeStringIO(io.StringIO):
     """StringIO class that can write to an additional destination."""
 
-    def __init__(
-        self, io: Union[io.TextIOWrapper, None], *args, **kwargs
-    ) -> None:
+    def __init__(self, io: Union[io.TextIOWrapper, None], *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self.io = io
 
@@ -414,19 +411,16 @@ later is required to fix a server side protocol bug.
             default=None,
             type=int,
             metavar="JOBS",
-            help="number of network jobs to run in parallel (defaults to "
-            "--jobs or 1). Ignored unless --no-interleaved is set",
+            help="number of network jobs to run in parallel (defaults to " "--jobs or 1). Ignored when --interleaved is set",
         )
         p.add_option(
             "--jobs-checkout",
             default=None,
             type=int,
             metavar="JOBS",
-            help=(
-                "number of local checkout jobs to run in parallel (defaults "
-                f"to --jobs or {DEFAULT_LOCAL_JOBS}). Ignored unless "
-                "--no-interleaved is set"
-            ),
+            help="number of local checkout jobs to run in parallel (defaults "
+            f"to --jobs or {DEFAULT_LOCAL_JOBS}). Ignored when --interleaved "
+            "is set",
         )
 
         p.add_option(
@@ -450,9 +444,7 @@ later is required to fix a server side protocol bug.
         p.add_option(
             "--force-checkout",
             action="store_true",
-            help="force checkout even if it results in throwing away "
-            "uncommitted modifications. "
-            "WARNING: this may cause loss of data",
+            help="force checkout even if it results in throwing away " "uncommitted modifications. " "WARNING: this may cause loss of data",
         )
         p.add_option(
             "--force-remove-dirty",
@@ -464,8 +456,7 @@ later is required to fix a server side protocol bug.
         p.add_option(
             "--rebase",
             action="store_true",
-            help="rebase local commits regardless of whether they are "
-            "published",
+            help="rebase local commits regardless of whether they are " "published",
         )
         p.add_option(
             "-l",
@@ -479,20 +470,12 @@ later is required to fix a server side protocol bug.
             dest="mp_update",
             action="store_false",
             default="true",
-            help="use the existing manifest checkout as-is. "
-            "(do not update to the latest revision)",
+            help="use the existing manifest checkout as-is. " "(do not update to the latest revision)",
         )
         p.add_option(
             "--interleaved",
             action="store_true",
-            default=True,
-            help="fetch and checkout projects in parallel (default)",
-        )
-        p.add_option(
-            "--no-interleaved",
-            dest="interleaved",
-            action="store_false",
-            help="fetch and checkout projects in phases",
+            help="fetch and checkout projects in parallel (experimental)",
         )
         p.add_option(
             "-n",
@@ -575,8 +558,7 @@ later is required to fix a server side protocol bug.
         p.add_option(
             "--optimized-fetch",
             action="store_true",
-            help="only fetch projects fixed to sha1 if revision does not exist "
-            "locally",
+            help="only fetch projects fixed to sha1 if revision does not exist " "locally",
         )
         p.add_option(
             "--retry-fetches",
@@ -613,8 +595,7 @@ later is required to fix a server side protocol bug.
                 "-s",
                 "--smart-sync",
                 action="store_true",
-                help="smart sync using manifest from the latest known good "
-                "build",
+                help="smart sync using manifest from the latest known good " "build",
             )
             p.add_option(
                 "-t",
@@ -663,14 +644,9 @@ later is required to fix a server side protocol bug.
             True if a superproject is requested, otherwise the value of the
             current_branch option (True, False or None).
         """
-        return (
-            git_superproject.UseSuperproject(opt.use_superproject, manifest)
-            or opt.current_branch_only
-        )
+        return git_superproject.UseSuperproject(opt.use_superproject, manifest) or opt.current_branch_only
 
-    def _UpdateProjectsRevisionId(
-        self, opt, args, superproject_logging_data, manifest
-    ):
+    def _UpdateProjectsRevisionId(self, opt, args, superproject_logging_data, manifest):
         """Update revisionId of projects with the commit from the superproject.
 
         This function updates each project's revisionId with the commit hash
@@ -685,9 +661,7 @@ later is required to fix a server side protocol bug.
             superproject_logging_data: A dictionary of superproject data to log.
             manifest: The manifest to use.
         """
-        have_superproject = manifest.superproject or any(
-            m.superproject for m in manifest.all_children
-        )
+        have_superproject = manifest.superproject or any(m.superproject for m in manifest.all_children)
         if not have_superproject:
             return
 
@@ -717,9 +691,7 @@ later is required to fix a server side protocol bug.
         for m in self.ManifestList(opt):
             if m.path_prefix not in per_manifest:
                 continue
-            use_super = git_superproject.UseSuperproject(
-                opt.use_superproject, m
-            )
+            use_super = git_superproject.UseSuperproject(opt.use_superproject, m)
             if superproject_logging_data:
                 superproject_logging_data["multimanifest"] = True
             superproject_logging_data.update(
@@ -734,21 +706,16 @@ later is required to fix a server side protocol bug.
                 superproject_logging_data["noworktree"] = True
                 if opt.use_superproject is not False:
                     logger.warning(
-                        "%s: not using superproject because there is no "
-                        "working tree.",
+                        "%s: not using superproject because there is no " "working tree.",
                         m.path_prefix,
                     )
 
             if not use_super:
                 continue
             m.superproject.SetQuiet(not opt.verbose)
-            print_messages = git_superproject.PrintMessages(
-                opt.use_superproject, m
-            )
+            print_messages = git_superproject.PrintMessages(opt.use_superproject, m)
             m.superproject.SetPrintMessages(print_messages)
-            update_result = m.superproject.UpdateProjectsRevisionId(
-                per_manifest[m.path_prefix], git_event_log=self.git_event_log
-            )
+            update_result = m.superproject.UpdateProjectsRevisionId(per_manifest[m.path_prefix], git_event_log=self.git_event_log)
             manifest_path = update_result.manifest_path
             superproject_logging_data["updatedrevisionid"] = bool(manifest_path)
             if manifest_path:
@@ -808,9 +775,7 @@ later is required to fix a server side protocol bug.
                 quiet=opt.quiet,
                 verbose=opt.verbose,
                 output_redir=buf,
-                current_branch_only=cls._GetCurrentBranchOnly(
-                    opt, project.manifest
-                ),
+                current_branch_only=cls._GetCurrentBranchOnly(opt, project.manifest),
                 force_sync=opt.force_sync,
                 clone_bundle=opt.clone_bundle,
                 tags=opt.tags,
@@ -856,9 +821,7 @@ later is required to fix a server side protocol bug.
             del cls.get_parallel_context()["sync_dict"][k]
 
         finish = time.time()
-        return _FetchOneResult(
-            success, errors, project_idx, start, finish, remote_fetched
-        )
+        return _FetchOneResult(success, errors, project_idx, start, finish, remote_fetched)
 
     def _GetSyncProgressMessage(self):
         earliest_time = float("inf")
@@ -942,9 +905,7 @@ later is required to fix a server side protocol bug.
 
         with self.ParallelContext():
             self.get_parallel_context()["projects"] = projects
-            self.get_parallel_context()[
-                "sync_dict"
-            ] = multiprocessing.Manager().dict()
+            self.get_parallel_context()["sync_dict"] = multiprocessing.Manager().dict()
 
             objdir_project_map = dict()
             for index, project in enumerate(projects):
@@ -979,14 +940,15 @@ later is required to fix a server side protocol bug.
                 sync_event.set()
                 sync_progress_thread.join()
 
+        self._fetch_times.Save()
+        self._local_sync_state.Save()
+
         if not self.outer_client.manifest.IsArchive:
             self._GCProjects(projects, opt, err_event)
 
         return _FetchResult(ret, fetched)
 
-    def _FetchMain(
-        self, opt, args, all_projects, err_event, ssh_proxy, manifest, errors
-    ):
+    def _FetchMain(self, opt, args, all_projects, err_event, ssh_proxy, manifest, errors):
         """The main network fetch loop.
 
         Args:
@@ -1004,58 +966,53 @@ later is required to fix a server side protocol bug.
         to_fetch.extend(all_projects)
         to_fetch.sort(key=self._fetch_times.Get, reverse=True)
 
-        try:
-            result = self._Fetch(to_fetch, opt, err_event, ssh_proxy, errors)
+        result = self._Fetch(to_fetch, opt, err_event, ssh_proxy, errors)
+        success = result.success
+        fetched = result.projects
+        if not success:
+            err_event.set()
+
+        if opt.network_only:
+            # Bail out now; the rest touches the working tree.
+            if err_event.is_set():
+                e = SyncError(
+                    "error: Exited sync due to fetch errors.",
+                    aggregate_errors=errors,
+                )
+
+                logger.error(e)
+                raise e
+            return _FetchMainResult([])
+
+        # Iteratively fetch missing and/or nested unregistered submodules.
+        previously_missing_set = set()
+        while True:
+            self._ReloadManifest(None, manifest)
+            all_projects = self.GetProjects(
+                args,
+                missing_ok=True,
+                submodules_ok=opt.fetch_submodules,
+                manifest=manifest,
+                all_manifests=not opt.this_manifest_only,
+            )
+            missing = []
+            for project in all_projects:
+                if project.gitdir not in fetched:
+                    missing.append(project)
+            if not missing:
+                break
+            # Stop us from non-stopped fetching actually-missing repos: If set
+            # of missing repos has not been changed from last fetch, we break.
+            missing_set = {p.name for p in missing}
+            if previously_missing_set == missing_set:
+                break
+            previously_missing_set = missing_set
+            result = self._Fetch(missing, opt, err_event, ssh_proxy, errors)
             success = result.success
-            fetched = result.projects
+            new_fetched = result.projects
             if not success:
                 err_event.set()
-
-            if opt.network_only:
-                # Bail out now; the rest touches the working tree.
-                if err_event.is_set():
-                    e = SyncError(
-                        "error: Exited sync due to fetch errors.",
-                        aggregate_errors=errors,
-                    )
-
-                    logger.error(e)
-                    raise e
-                return _FetchMainResult([])
-
-            # Iteratively fetch missing and/or nested unregistered submodules.
-            previously_missing_set = set()
-            while True:
-                self._ReloadManifest(None, manifest)
-                all_projects = self.GetProjects(
-                    args,
-                    missing_ok=True,
-                    submodules_ok=opt.fetch_submodules,
-                    manifest=manifest,
-                    all_manifests=not opt.this_manifest_only,
-                )
-                missing = []
-                for project in all_projects:
-                    if project.gitdir not in fetched:
-                        missing.append(project)
-                if not missing:
-                    break
-                # Stop us from non-stopped fetching actually-missing repos: If
-                # set of missing repos has not been changed from last fetch, we
-                # break.
-                missing_set = {p.name for p in missing}
-                if previously_missing_set == missing_set:
-                    break
-                previously_missing_set = missing_set
-                result = self._Fetch(missing, opt, err_event, ssh_proxy, errors)
-                success = result.success
-                new_fetched = result.projects
-                if not success:
-                    err_event.set()
-                fetched.update(new_fetched)
-        finally:
-            self._fetch_times.Save()
-            self._local_sync_state.Save()
+            fetched.update(new_fetched)
 
         return _FetchMainResult(all_projects)
 
@@ -1086,9 +1043,7 @@ later is required to fix a server side protocol bug.
         """
         project = cls.get_parallel_context()["projects"][project_idx]
         start = time.time()
-        syncbuf = SyncBuffer(
-            project.manifest.manifestProject.config, detach_head=detach_head
-        )
+        syncbuf = SyncBuffer(project.manifest.manifestProject.config, detach_head=detach_head)
         success = False
         errors = []
         try:
@@ -1097,16 +1052,14 @@ later is required to fix a server side protocol bug.
                 force_sync=force_sync,
                 force_checkout=force_checkout,
                 force_rebase=force_rebase,
+                errors=errors,
                 verbose=verbose,
             )
             success = syncbuf.Finish()
-            errors.extend(syncbuf.errors)
         except KeyboardInterrupt:
             logger.error("Keyboard interrupt while processing %s", project.name)
         except GitError as e:
-            logger.error(
-                "error.GitError: Cannot checkout %s: %s", project.name, e
-            )
+            logger.error("error.GitError: Cannot checkout %s: %s", project.name, e)
             errors.append(e)
         except Exception as e:
             logger.error(
@@ -1138,14 +1091,10 @@ later is required to fix a server side protocol bug.
             ret = True
             for result in results:
                 success = result.success
-                project = self.get_parallel_context()["projects"][
-                    result.project_idx
-                ]
+                project = self.get_parallel_context()["projects"][result.project_idx]
                 start = result.start
                 finish = result.finish
-                self.event_log.AddSync(
-                    project, event_log.TASK_SYNC_LOCAL, start, finish, success
-                )
+                self.event_log.AddSync(project, event_log.TASK_SYNC_LOCAL, start, finish, success)
 
                 if result.errors:
                     checkout_errors.extend(result.errors)
@@ -1156,9 +1105,7 @@ later is required to fix a server side protocol bug.
                     self._local_sync_state.SetCheckoutTime(project)
                 else:
                     ret = False
-                    err_results.append(
-                        project.RelPath(local=opt.this_manifest_only)
-                    )
+                    err_results.append(project.RelPath(local=opt.this_manifest_only))
                     if opt.fail_fast:
                         if pool:
                             pool.close()
@@ -1181,9 +1128,7 @@ later is required to fix a server side protocol bug.
                     ),
                     range(len(projects)),
                     callback=_ProcessResults,
-                    output=Progress(
-                        "Checking out", len(all_projects), quiet=opt.quiet
-                    ),
+                    output=Progress("Checking out", len(all_projects), quiet=opt.quiet),
                     # Use chunksize=1 to avoid the chance that some workers are
                     # idle while other workers still have more than one job in
                     # their chunk queue.
@@ -1218,9 +1163,7 @@ later is required to fix a server side protocol bug.
         """
         if project.use_git_worktrees:
             return False
-        projects = project.manifest.GetProjectsWithName(
-            project.name, all_manifests=True
-        )
+        projects = project.manifest.GetProjectsWithName(project.name, all_manifests=True)
         if len(projects) == 1:
             return False
         if len(projects) > 1:
@@ -1251,22 +1194,15 @@ later is required to fix a server side protocol bug.
             opt: options given to sync.
         """
         expected = self._GetPreciousObjectsState(project, opt)
-        actual = (
-            project.config.GetBoolean("extensions.preciousObjects") or False
-        )
+        actual = project.config.GetBoolean("extensions.preciousObjects") or False
         relpath = project.RelPath(local=opt.this_manifest_only)
 
         if expected != actual:
             # If this is unexpected, log it and repair.
-            Trace(
-                f"{relpath} expected preciousObjects={expected}, got {actual}"
-            )
+            Trace(f"{relpath} expected preciousObjects={expected}, got {actual}")
             if expected:
                 if not opt.quiet:
-                    print(
-                        "\r%s: Shared project %s found, disabling pruning."
-                        % (relpath, project.name)
-                    )
+                    print("\r%s: Shared project %s found, disabling pruning." % (relpath, project.name))
 
                 if git_require((2, 7, 0)):
                     project.EnableRepositoryExtension("preciousObjects")
@@ -1274,9 +1210,7 @@ later is required to fix a server side protocol bug.
                     # This isn't perfect, but it's the best we can do with old
                     # git.
                     logger.warning(
-                        "%s: WARNING: shared projects are unreliable when "
-                        "using old versions of git; please upgrade to "
-                        "git-2.7.0+.",
+                        "%s: WARNING: shared projects are unreliable when " "using old versions of git; please upgrade to " "git-2.7.0+.",
                         relpath,
                     )
                     project.config.SetString("gc.pruneExpire", "never")
@@ -1297,9 +1231,7 @@ later is required to fix a server side protocol bug.
                 self._SetPreciousObjectsState(project, opt)
             return
 
-        pm = Progress(
-            "Garbage collecting", len(projects), delay=False, quiet=opt.quiet
-        )
+        pm = Progress("Garbage collecting", len(projects), delay=False, quiet=opt.quiet)
         pm.update(inc=0, msg="prescan")
 
         tidy_dirs = {}
@@ -1375,110 +1307,6 @@ later is required to fix a server side protocol bug.
             t.join()
         pm.end()
 
-    @classmethod
-    def _CheckOneBloatedProject(cls, project_index: int) -> Optional[str]:
-        """Checks if a single project is bloated.
-
-        Args:
-            project_index: The index of the project in the parallel context.
-
-        Returns:
-            The name of the project if it is bloated, else None.
-        """
-        project = cls.get_parallel_context()["projects"][project_index]
-
-        if not project.Exists or not project.worktree:
-            return None
-
-        # Only check dirty or locally modified projects. These can't be
-        # freshly cloned and will accumulate garbage.
-        try:
-            is_dirty = project.IsDirty(consider_untracked=True)
-
-            manifest_rev = project.GetRevisionId(project.bare_ref.all)
-            head_rev = project.work_git.rev_parse(HEAD)
-            has_local_commits = manifest_rev != head_rev
-
-            if not (is_dirty or has_local_commits):
-                return None
-
-            output = project.bare_git.count_objects("-v")
-        except Exception:
-            return None
-
-        stats = {}
-        for line in output.splitlines():
-            try:
-                key, value = line.split(": ", 1)
-                stats[key.strip()] = int(value.strip())
-            except ValueError:
-                pass
-
-        pack_count = stats.get("packs", 0)
-        size_pack_kb = stats.get("size-pack", 0)
-        size_garbage_kb = stats.get("size-garbage", 0)
-
-        is_fragmented = (
-            pack_count > _BLOAT_PACK_COUNT_THRESHOLD
-            and size_pack_kb > _BLOAT_SIZE_PACK_THRESHOLD_KB
-        )
-        has_excessive_garbage = (
-            size_garbage_kb > _BLOAT_SIZE_GARBAGE_THRESHOLD_KB
-        )
-
-        if is_fragmented or has_excessive_garbage:
-            return project.name
-        return None
-
-    def _CheckForBloatedProjects(self, projects, opt):
-        """Check for shallow projects that are accumulating unoptimized data.
-
-        For projects with clone-depth="1" that are dirty (have local changes),
-        run 'git count-objects -v' and warn if the repository is accumulating
-        excessive pack files or garbage.
-        """
-        # We only care about bloated projects if we have a git version that
-        # supports --no-auto-gc (2.23.0+) since what we use to disable auto-gc
-        # in Project._RemoteFetch.
-        if not git_require((2, 23, 0)):
-            return
-
-        projects = [p for p in projects if p.clone_depth]
-        if not projects:
-            return
-
-        bloated_projects = []
-        pm = Progress(
-            "Checking for bloat", len(projects), delay=False, quiet=opt.quiet
-        )
-
-        def _ProcessResults(pool, pm, results):
-            for result in results:
-                if result:
-                    bloated_projects.append(result)
-                pm.update(msg="")
-
-        with self.ParallelContext():
-            self.get_parallel_context()["projects"] = projects
-            self.ExecuteInParallel(
-                opt.jobs,
-                self._CheckOneBloatedProject,
-                range(len(projects)),
-                callback=_ProcessResults,
-                output=pm,
-                chunksize=1,
-            )
-        pm.end()
-
-        for project_name in bloated_projects:
-            warn_msg = (
-                f'warning: Project "{project_name}" is accumulating '
-                'unoptimized data. Please run "repo sync --auto-gc" or '
-                '"repo gc --repack" to clean up.'
-            )
-            self.git_event_log.ErrorEvent(warn_msg)
-            logger.warning(warn_msg)
-
     def _UpdateRepoProject(self, opt, manifest, errors):
         """Fetch the repo project and check for updates."""
         if opt.local_only:
@@ -1499,9 +1327,7 @@ later is required to fix a server side protocol bug.
                     quiet=opt.quiet,
                     verbose=opt.verbose,
                     output_redir=buf,
-                    current_branch_only=self._GetCurrentBranchOnly(
-                        opt, manifest
-                    ),
+                    current_branch_only=self._GetCurrentBranchOnly(opt, manifest),
                     force_sync=opt.force_sync,
                     clone_bundle=opt.clone_bundle,
                     tags=opt.tags,
@@ -1563,9 +1389,7 @@ later is required to fix a server side protocol bug.
             1: failure
         """
         new_project_paths = []
-        for project in self.GetProjects(
-            None, missing_ok=True, manifest=manifest, all_manifests=False
-        ):
+        for project in self.GetProjects(None, missing_ok=True, manifest=manifest, all_manifests=False):
             if project.relpath:
                 new_project_paths.append(project.relpath)
         file_name = "project.list"
@@ -1597,9 +1421,7 @@ later is required to fix a server side protocol bug.
                             revisionId=None,
                             groups=None,
                         )
-                        project.DeleteWorktree(
-                            verbose=opt.verbose, force=opt.force_remove_dirty
-                        )
+                        project.DeleteWorktree(verbose=opt.verbose, force=opt.force_remove_dirty)
 
         new_project_paths.sort()
         with open(file_path, "w") as fd:
@@ -1616,9 +1438,7 @@ later is required to fix a server side protocol bug.
         new_paths = {}
         new_linkfile_paths = []
         new_copyfile_paths = []
-        for project in self.GetProjects(
-            None, missing_ok=True, manifest=manifest, all_manifests=False
-        ):
+        for project in self.GetProjects(None, missing_ok=True, manifest=manifest, all_manifests=False):
             new_linkfile_paths.extend(x.dest for x in project.linkfiles)
             new_copyfile_paths.extend(x.dest for x in project.copyfiles)
 
@@ -1644,14 +1464,8 @@ later is required to fix a server side protocol bug.
                     raise
 
             need_remove_files = []
-            need_remove_files.extend(
-                set(old_copylinkfile_paths.get("linkfile", []))
-                - set(new_linkfile_paths)
-            )
-            need_remove_files.extend(
-                set(old_copylinkfile_paths.get("copyfile", []))
-                - set(new_copyfile_paths)
-            )
+            need_remove_files.extend(set(old_copylinkfile_paths.get("linkfile", [])) - set(new_linkfile_paths))
+            need_remove_files.extend(set(old_copylinkfile_paths.get("copyfile", [])) - set(new_copyfile_paths))
 
             for need_remove_file in need_remove_files:
                 # Try to remove the updated copyfile or linkfile.
@@ -1669,10 +1483,7 @@ later is required to fix a server side protocol bug.
 
     def _SmartSyncSetup(self, opt, smart_sync_manifest_path, manifest):
         if not manifest.manifest_server:
-            raise SmartSyncError(
-                "error: cannot smart sync: no manifest server defined in "
-                "manifest"
-            )
+            raise SmartSyncError("error: cannot smart sync: no manifest server defined in " "manifest")
 
         manifest_server = manifest.manifest_server
         if not opt.quiet:
@@ -1706,9 +1517,7 @@ later is required to fix a server side protocol bug.
                         logger.error("Error parsing .netrc file: %s", e)
 
             if username and password:
-                manifest_server = manifest_server.replace(
-                    "://", f"://{username}:{password}@", 1
-                )
+                manifest_server = manifest_server.replace("://", f"://{username}:{password}@", 1)
 
         transport = PersistentTransport(manifest_server)
         if manifest_server.startswith("persistent-"):
@@ -1722,33 +1531,20 @@ later is required to fix a server side protocol bug.
 
                 if "SYNC_TARGET" in os.environ:
                     target = os.environ["SYNC_TARGET"]
-                    [success, manifest_str] = server.GetApprovedManifest(
-                        branch, target
-                    )
-                elif (
-                    "TARGET_PRODUCT" in os.environ
-                    and "TARGET_BUILD_VARIANT" in os.environ
-                    and "TARGET_RELEASE" in os.environ
-                ):
+                    [success, manifest_str] = server.GetApprovedManifest(branch, target)
+                elif "TARGET_PRODUCT" in os.environ and "TARGET_BUILD_VARIANT" in os.environ and "TARGET_RELEASE" in os.environ:
                     target = "%s-%s-%s" % (
                         os.environ["TARGET_PRODUCT"],
                         os.environ["TARGET_RELEASE"],
                         os.environ["TARGET_BUILD_VARIANT"],
                     )
-                    [success, manifest_str] = server.GetApprovedManifest(
-                        branch, target
-                    )
-                elif (
-                    "TARGET_PRODUCT" in os.environ
-                    and "TARGET_BUILD_VARIANT" in os.environ
-                ):
+                    [success, manifest_str] = server.GetApprovedManifest(branch, target)
+                elif "TARGET_PRODUCT" in os.environ and "TARGET_BUILD_VARIANT" in os.environ:
                     target = "%s-%s" % (
                         os.environ["TARGET_PRODUCT"],
                         os.environ["TARGET_BUILD_VARIANT"],
                     )
-                    [success, manifest_str] = server.GetApprovedManifest(
-                        branch, target
-                    )
+                    [success, manifest_str] = server.GetApprovedManifest(branch, target)
                 else:
                     [success, manifest_str] = server.GetApprovedManifest(branch)
             else:
@@ -1762,25 +1558,20 @@ later is required to fix a server side protocol bug.
                         f.write(manifest_str)
                 except OSError as e:
                     raise SmartSyncError(
-                        "error: cannot write manifest to %s:\n%s"
-                        % (smart_sync_manifest_path, e),
+                        "error: cannot write manifest to %s:\n%s" % (smart_sync_manifest_path, e),
                         aggregate_errors=[e],
                     )
                 self._ReloadManifest(manifest_name, manifest)
             else:
-                raise SmartSyncError(
-                    "error: manifest server RPC call failed: %s" % manifest_str
-                )
+                raise SmartSyncError("error: manifest server RPC call failed: %s" % manifest_str)
         except (OSError, xmlrpc.client.Fault) as e:
             raise SmartSyncError(
-                "error: cannot connect to manifest server %s:\n%s"
-                % (manifest.manifest_server, e),
+                "error: cannot connect to manifest server %s:\n%s" % (manifest.manifest_server, e),
                 aggregate_errors=[e],
             )
         except xmlrpc.client.ProtocolError as e:
             raise SmartSyncError(
-                "error: cannot connect to manifest server %s:\n%d %s"
-                % (manifest.manifest_server, e.errcode, e.errmsg),
+                "error: cannot connect to manifest server %s:\n%d %s" % (manifest.manifest_server, e.errcode, e.errmsg),
                 aggregate_errors=[e],
             )
 
@@ -1810,9 +1601,7 @@ later is required to fix a server side protocol bug.
                     tags=opt.tags,
                     git_event_log=self.git_event_log,
                 )
-                self._UpdateAllManifestProjects(
-                    opt, child.manifestProject, None, errors
-                )
+                self._UpdateAllManifestProjects(opt, child.manifestProject, None, errors)
 
     def _UpdateManifestProject(self, opt, mp, manifest_name, errors):
         """Fetch & update the local manifest project.
@@ -1830,9 +1619,7 @@ later is required to fix a server side protocol bug.
                     quiet=not opt.verbose,
                     output_redir=buf,
                     verbose=opt.verbose,
-                    current_branch_only=self._GetCurrentBranchOnly(
-                        opt, mp.manifest
-                    ),
+                    current_branch_only=self._GetCurrentBranchOnly(opt, mp.manifest),
                     force_sync=opt.force_sync,
                     tags=opt.tags,
                     optimized_fetch=opt.optimized_fetch,
@@ -1845,15 +1632,11 @@ later is required to fix a server side protocol bug.
                 if result.error:
                     errors.append(result.error)
             except KeyboardInterrupt:
-                errors.append(
-                    ManifestInterruptError(buf.getvalue(), project=mp.name)
-                )
+                errors.append(ManifestInterruptError(buf.getvalue(), project=mp.name))
                 raise
 
             finish = time.time()
-            self.event_log.AddSync(
-                mp, event_log.TASK_SYNC_NETWORK, start, finish, result.success
-            )
+            self.event_log.AddSync(mp, event_log.TASK_SYNC_NETWORK, start, finish, result.success)
 
         if mp.HasChanges:
             errors = []
@@ -1862,23 +1645,18 @@ later is required to fix a server side protocol bug.
             mp.Sync_LocalHalf(
                 syncbuf,
                 submodules=mp.manifest.HasSubmodules,
+                errors=errors,
                 verbose=opt.verbose,
             )
             clean = syncbuf.Finish()
-            errors.extend(syncbuf.errors)
-            self.event_log.AddSync(
-                mp, event_log.TASK_SYNC_LOCAL, start, time.time(), clean
-            )
+            self.event_log.AddSync(mp, event_log.TASK_SYNC_LOCAL, start, time.time(), clean)
             if not clean:
                 raise UpdateManifestError(aggregate_errors=errors)
             self._ReloadManifest(manifest_name, mp.manifest)
 
     def ValidateOptions(self, opt, args):
         if opt.force_broken:
-            logger.warning(
-                "warning: -f/--force-broken is now the default behavior, and "
-                "the options are deprecated"
-            )
+            logger.warning("warning: -f/--force-broken is now the default behavior, and " "the options are deprecated")
         if opt.network_only and opt.detach_head:
             self.OptionParser.error("cannot combine -n and -d")
         if opt.network_only and opt.local_only:
@@ -1889,9 +1667,7 @@ later is required to fix a server side protocol bug.
             self.OptionParser.error("cannot combine -m and -t")
         if opt.manifest_server_username or opt.manifest_server_password:
             if not (opt.smart_sync or opt.smart_tag):
-                self.OptionParser.error(
-                    "-u and -p may only be combined with -s or -t"
-                )
+                self.OptionParser.error("-u and -p may only be combined with -s or -t")
             if None in [
                 opt.manifest_server_username,
                 opt.manifest_server_password,
@@ -1940,53 +1716,80 @@ later is required to fix a server side protocol bug.
         opt.jobs_network = min(opt.jobs_network, jobs_soft_limit)
         opt.jobs_checkout = min(opt.jobs_checkout, jobs_soft_limit)
 
-        sync_j_max = mp.manifest.default.sync_j_max or None
-
-        # Check for shared options.
+        # Warn once if effective job counts seem excessively high.
         # Prioritize --jobs, then --jobs-network, then --jobs-checkout.
-        job_attributes = (
-            ("--jobs", "jobs"),
-            ("--jobs-network", "jobs_network"),
-            ("--jobs-checkout", "jobs_checkout"),
+        job_options_to_check = (
+            ("--jobs", opt.jobs),
+            ("--jobs-network", opt.jobs_network),
+            ("--jobs-checkout", opt.jobs_checkout),
         )
-
-        warned = False
-        limit_warned = False
-        for name, attr in job_attributes:
-            value = getattr(opt, attr)
-
-            if sync_j_max and value > sync_j_max:
-                if not limit_warned:
-                    logger.warning(
-                        "warning: manifest limits %s to %d",
-                        name,
-                        sync_j_max,
-                    )
-                    limit_warned = True
-                setattr(opt, attr, sync_j_max)
-                value = sync_j_max
-
-            if not warned and value > self._JOBS_WARN_THRESHOLD:
+        for name, value in job_options_to_check:
+            if value > self._JOBS_WARN_THRESHOLD:
                 logger.warning(
-                    "High job count (%d > %d) specified for %s; this may "
-                    "lead to excessive resource usage or diminishing returns.",
+                    "High job count (%d > %d) specified for %s; this may " "lead to excessive resource usage or diminishing returns.",
                     value,
                     self._JOBS_WARN_THRESHOLD,
                     name,
                 )
-                warned = True
+                break
+
+    def _SyncJfrogArtifacts(self, manifest):
+        """Parse manifest jfrog nodes and download artifacts before git sync."""
+        try:
+            manifest_path = Path(getattr(manifest.manifestProject, "manifestFile", None) or manifest.manifestFile)
+        except Exception:
+            return
+        if not manifest_path.is_file():
+            return
+        tree = ET.parse(manifest_path)
+        root_topdir = tree.getroot()
+        xml_file_node = root_topdir.find("include")
+        xml_file_path = os.path.join(manifest.topdir, ".repo/manifests/", xml_file_node.attrib.get("name"))
+        print(f"开始处理JFrog配置文件: {xml_file_path}")
+        root = ET.parse(xml_file_path).getroot()
+
+        art_nodes = root.findall(".//Artifactory")
+        if not art_nodes:
+            return
+
+        for art_node in art_nodes:
+            art_url = art_node.attrib.get("url")
+            if not art_url:
+                logger.warning("Skip Artifactory node missing url: %s", ET.tostring(art_node, encoding="unicode"))
+                continue
+            art_url = art_url.rstrip("/")
+
+            jfrog_nodes = art_node.findall("jfrog")
+            if not jfrog_nodes:
+                logger.warning("Skip Artifactory without jfrog children: %s", ET.tostring(art_node, encoding="unicode"))
+                continue
+
+            for node in jfrog_nodes:
+                name = node.attrib.get("name")
+                version = node.attrib.get("version")
+                local_path = node.attrib.get("local_path")
+                if not all([name, version, local_path]):
+                    logger.warning("Skip jfrog node missing attrs: %s", ET.tostring(node, encoding="unicode"))
+                    continue
+                jfrog.sync_one(
+                    name=name,
+                    version=version,
+                    local_path=local_path,
+                    artifactory_url=art_url,
+                )
 
     def Execute(self, opt, args):
         errors = []
         try:
             self._ExecuteHelper(opt, args, errors)
+            # Run post-sync hook only after successful sync
+            hook_success = self._RunPostSyncHook(opt)
+            if not hook_success:
+                raise SyncError("post-sync hook failed")
         except (RepoExitError, RepoChangedException):
             raise
         except (KeyboardInterrupt, Exception) as e:
             raise RepoUnhandledExceptionError(e, aggregate_errors=errors)
-
-        # Run post-sync hook only after successful sync
-        self._RunPostSyncHook(opt)
 
     def _RunPostSyncHook(self, opt):
         """Run post-sync hook if configured in manifest <repo-hooks>."""
@@ -1999,6 +1802,7 @@ later is required to fix a server side protocol bug.
         success = hook.Run(repo_topdir=self.client.topdir)
         if not success:
             print("Warning: post-sync hook reported failure.")
+        return success
 
     def _ExecuteHelper(self, opt, args, errors):
         manifest = self.outer_manifest
@@ -2009,25 +1813,20 @@ later is required to fix a server side protocol bug.
             manifest.Override(opt.manifest_name)
 
         manifest_name = opt.manifest_name
-        smart_sync_manifest_path = os.path.join(
-            manifest.manifestProject.worktree, "smart_sync_override.xml"
-        )
+        smart_sync_manifest_path = os.path.join(manifest.manifestProject.worktree, "smart_sync_override.xml")
 
         if opt.clone_bundle is None:
             opt.clone_bundle = manifest.CloneBundle
 
         if opt.smart_sync or opt.smart_tag:
-            manifest_name = self._SmartSyncSetup(
-                opt, smart_sync_manifest_path, manifest
-            )
+            manifest_name = self._SmartSyncSetup(opt, smart_sync_manifest_path, manifest)
         else:
             if os.path.isfile(smart_sync_manifest_path):
                 try:
                     platform_utils.remove(smart_sync_manifest_path)
                 except OSError as e:
                     logger.error(
-                        "error: failed to remove existing smart sync override "
-                        "manifest: %s",
+                        "error: failed to remove existing smart sync override " "manifest: %s",
                         e,
                     )
 
@@ -2038,9 +1837,7 @@ later is required to fix a server side protocol bug.
             base = rp.GetBranch(cb).merge
             if not base or not base.startswith("refs/heads/"):
                 logger.warning(
-                    "warning: repo is not tracking a remote branch, so it will "
-                    "not receive updates; run `repo init --repo-rev=stable` to "
-                    "fix."
+                    "warning: repo is not tracking a remote branch, so it will " "not receive updates; run `repo init --repo-rev=stable` to " "fix."
                 )
 
         for m in self.ManifestList(opt):
@@ -2055,9 +1852,7 @@ later is required to fix a server side protocol bug.
         if _REPO_ALLOW_SHALLOW is not None:
             if _REPO_ALLOW_SHALLOW == "1":
                 mp.ConfigureCloneFilterForDepth(None)
-            elif (
-                _REPO_ALLOW_SHALLOW == "0" and mp.clone_filter_for_depth is None
-            ):
+            elif _REPO_ALLOW_SHALLOW == "0" and mp.clone_filter_for_depth is None:
                 mp.ConfigureCloneFilterForDepth("blob:none")
 
         if opt.mp_update:
@@ -2073,9 +1868,7 @@ later is required to fix a server side protocol bug.
         self._UpdateRepoProject(opt, manifest, errors)
 
         superproject_logging_data = {}
-        self._UpdateProjectsRevisionId(
-            opt, args, superproject_logging_data, manifest
-        )
+        self._UpdateProjectsRevisionId(opt, args, superproject_logging_data, manifest)
 
         all_projects = self.GetProjects(
             args,
@@ -2088,9 +1881,7 @@ later is required to fix a server side protocol bug.
         # Log the repo projects by existing and new.
         existing = [x for x in all_projects if x.Exists]
         mp.config.SetString("repo.existingprojectcount", str(len(existing)))
-        mp.config.SetString(
-            "repo.newprojectcount", str(len(all_projects) - len(existing))
-        )
+        mp.config.SetString("repo.newprojectcount", str(len(all_projects) - len(existing)))
 
         self._fetch_times = _FetchTimes(manifest)
         self._local_sync_state = LocalSyncState(manifest)
@@ -2111,32 +1902,28 @@ later is required to fix a server side protocol bug.
         )
 
         # Log the previous sync analysis state from the config.
-        self.git_event_log.LogDataConfigEvents(
-            mp.config.GetSyncAnalysisStateData(), "previous_sync_state"
-        )
+        self.git_event_log.LogDataConfigEvents(mp.config.GetSyncAnalysisStateData(), "previous_sync_state")
 
         # Update and log with the new sync analysis state.
         mp.config.UpdateSyncAnalysisState(opt, superproject_logging_data)
-        self.git_event_log.LogDataConfigEvents(
-            mp.config.GetSyncAnalysisStateData(), "current_sync_state"
-        )
+        self.git_event_log.LogDataConfigEvents(mp.config.GetSyncAnalysisStateData(), "current_sync_state")
 
         self._local_sync_state.PruneRemovedProjects()
         if self._local_sync_state.IsPartiallySynced():
-            logger.warning(
-                "warning: Partial syncs are not supported. For the best "
-                "experience, sync the entire tree."
-            )
-
-        if existing:
-            self._CheckForBloatedProjects(all_projects, opt)
+            logger.warning("warning: Partial syncs are not supported. For the best " "experience, sync the entire tree.")
 
         if not opt.quiet:
             print("repo sync has finished successfully.")
 
-    def _CreateSyncProgressThread(
-        self, pm: Progress, stop_event: _threading.Event
-    ) -> _threading.Thread:
+        # Download JFrog artifacts specified in manifest before git sync.
+        # Skip when --local-only is used.
+        if not opt.local_only:
+            try:
+                self._SyncJfrogArtifacts(manifest)
+            except Exception as e:
+                logger.warning("warning: failed to sync JFrog artifacts: %s", e)
+
+    def _CreateSyncProgressThread(self, pm: Progress, stop_event: _threading.Event) -> _threading.Thread:
         """Creates and returns a daemon thread to update a Progress object.
 
         The returned thread is not yet started. The thread will periodically
@@ -2204,9 +1991,7 @@ later is required to fix a server side protocol bug.
                 err_update_linkfiles = True
                 errors.append(e)
                 if opt.fail_fast:
-                    logger.error(
-                        "error: Local update copyfile or linkfile failed."
-                    )
+                    logger.error("error: Local update copyfile or linkfile failed.")
                     raise SyncFailFastError(aggregate_errors=errors)
         return err_update_projects, err_update_linkfiles
 
@@ -2245,9 +2030,7 @@ later is required to fix a server side protocol bug.
                     "Failing repos (checkout):\n%s",
                     "\n".join(sorted(failing_checkout_repos)),
                 )
-        logger.error(
-            'Try re-running with "-j1 --fail-fast" to exit at the first error.'
-        )
+        logger.error('Try re-running with "-j1 --fail-fast" to exit at the first error.')
         raise SyncError(aggregate_errors=errors)
 
     def _SyncPhased(
@@ -2316,9 +2099,7 @@ later is required to fix a server side protocol bug.
 
         err_results = []
         # NB: We don't exit here because this is the last step.
-        err_checkout = not self._Checkout(
-            all_projects, opt, err_results, errors
-        )
+        err_checkout = not self._Checkout(all_projects, opt, err_results, errors)
         if err_checkout:
             err_event.set()
 
@@ -2340,7 +2121,7 @@ later is required to fix a server side protocol bug.
         """Syncs a single project for interleaved sync."""
         fetch_success = False
         remote_fetched = False
-        fetch_errors = []
+        fetch_error = None
         fetch_start = None
         fetch_finish = None
         network_output = ""
@@ -2356,9 +2137,7 @@ later is required to fix a server side protocol bug.
                     quiet=opt.quiet,
                     verbose=opt.verbose,
                     output_redir=network_output_capture,
-                    current_branch_only=cls._GetCurrentBranchOnly(
-                        opt, project.manifest
-                    ),
+                    current_branch_only=cls._GetCurrentBranchOnly(opt, project.manifest),
                     force_sync=opt.force_sync,
                     clone_bundle=opt.clone_bundle,
                     tags=opt.tags,
@@ -2373,17 +2152,14 @@ later is required to fix a server side protocol bug.
                 )
                 fetch_success = sync_result.success
                 remote_fetched = sync_result.remote_fetched
-                if sync_result.error:
-                    fetch_errors.append(sync_result.error)
+                fetch_error = sync_result.error
             except KeyboardInterrupt:
-                logger.error(
-                    "Keyboard interrupt while processing %s", project.name
-                )
+                logger.error("Keyboard interrupt while processing %s", project.name)
             except GitError as e:
-                fetch_errors.append(e)
+                fetch_error = e
                 logger.error("error.GitError: Cannot fetch %s", e)
             except Exception as e:
-                fetch_errors.append(e)
+                fetch_error = e
                 logger.error(
                     "error: Cannot fetch %s (%s: %s)",
                     project.name,
@@ -2395,58 +2171,50 @@ later is required to fix a server side protocol bug.
                 network_output = network_output_capture.getvalue()
 
         checkout_success = False
-        checkout_errors = []
+        checkout_error = None
         checkout_start = None
         checkout_finish = None
         checkout_stderr = ""
 
-        if fetch_success:
-            # We skip checkout if it's network-only or if the project has no
-            # working tree (e.g., a mirror).
-            if opt.network_only or not project.worktree:
-                checkout_success = True
-            else:
-                # This is a normal project that needs a checkout.
-                checkout_start = time.time()
-                stderr_capture = io.StringIO()
-                try:
-                    with contextlib.redirect_stderr(stderr_capture):
-                        syncbuf = SyncBuffer(
-                            project.manifest.manifestProject.config,
-                            detach_head=opt.detach_head,
-                        )
-                        project.Sync_LocalHalf(
-                            syncbuf,
-                            force_sync=opt.force_sync,
-                            force_checkout=opt.force_checkout,
-                            force_rebase=opt.rebase,
-                            verbose=opt.verbose,
-                        )
-                        checkout_success = syncbuf.Finish()
-                        if syncbuf.errors:
-                            checkout_errors.extend(syncbuf.errors)
-                except KeyboardInterrupt:
-                    logger.error(
-                        "Keyboard interrupt while processing %s", project.name
+        if fetch_success and not opt.network_only:
+            checkout_start = time.time()
+            stderr_capture = io.StringIO()
+            try:
+                with contextlib.redirect_stderr(stderr_capture):
+                    syncbuf = SyncBuffer(
+                        project.manifest.manifestProject.config,
+                        detach_head=opt.detach_head,
                     )
-                except GitError as e:
-                    checkout_errors.append(e)
-                    logger.error(
-                        "error.GitError: Cannot checkout %s: %s",
-                        project.name,
-                        e,
+                    local_half_errors = []
+                    project.Sync_LocalHalf(
+                        syncbuf,
+                        force_sync=opt.force_sync,
+                        force_checkout=opt.force_checkout,
+                        force_rebase=opt.rebase,
+                        errors=local_half_errors,
+                        verbose=opt.verbose,
                     )
-                except Exception as e:
-                    checkout_errors.append(e)
-                    logger.error(
-                        "error: Cannot checkout %s: %s: %s",
-                        project.name,
-                        type(e).__name__,
-                        e,
-                    )
-                finally:
-                    checkout_finish = time.time()
-                    checkout_stderr = stderr_capture.getvalue()
+                    checkout_success = syncbuf.Finish()
+                    if local_half_errors:
+                        checkout_error = SyncError(aggregate_errors=local_half_errors)
+            except KeyboardInterrupt:
+                logger.error("Keyboard interrupt while processing %s", project.name)
+            except GitError as e:
+                checkout_error = e
+                logger.error("error.GitError: Cannot checkout %s: %s", project.name, e)
+            except Exception as e:
+                checkout_error = e
+                logger.error(
+                    "error: Cannot checkout %s: %s: %s",
+                    project.name,
+                    type(e).__name__,
+                    e,
+                )
+            finally:
+                checkout_finish = time.time()
+                checkout_stderr = stderr_capture.getvalue()
+        elif fetch_success:
+            checkout_success = True
 
         # Consolidate all captured output.
         captured_parts = []
@@ -2462,8 +2230,8 @@ later is required to fix a server side protocol bug.
             fetch_success=fetch_success,
             remote_fetched=remote_fetched,
             checkout_success=checkout_success,
-            fetch_errors=fetch_errors,
-            checkout_errors=checkout_errors,
+            fetch_error=fetch_error,
+            checkout_error=checkout_error,
             stderr_text=stderr_text.strip(),
             fetch_start=fetch_start,
             fetch_finish=fetch_finish,
@@ -2509,7 +2277,7 @@ later is required to fix a server side protocol bug.
 
     def _ProcessSyncInterleavedResults(
         self,
-        finished_relpaths: Set[str],
+        synced_relpaths: Set[str],
         err_event: _threading.Event,
         errors: List[Exception],
         opt: optparse.Values,
@@ -2525,8 +2293,7 @@ later is required to fix a server side protocol bug.
                 pm.update()
                 project = projects[result.project_index]
 
-                success = result.fetch_success and result.checkout_success
-                if result.stderr_text and (opt.verbose or not success):
+                if opt.verbose and result.stderr_text:
                     pm.display_message(result.stderr_text)
 
                 if result.fetch_start:
@@ -2553,23 +2320,19 @@ later is required to fix a server side protocol bug.
                         result.checkout_success,
                     )
 
-                finished_relpaths.add(result.relpath)
-
-                if not success:
+                if result.fetch_success and result.checkout_success:
+                    synced_relpaths.add(result.relpath)
+                else:
                     ret = False
                     err_event.set()
-                    if result.fetch_errors:
-                        errors.extend(result.fetch_errors)
+                    if result.fetch_error:
+                        errors.append(result.fetch_error)
                         self._interleaved_err_network = True
-                        self._interleaved_err_network_results.append(
-                            result.relpath
-                        )
-                    if result.checkout_errors:
-                        errors.extend(result.checkout_errors)
+                        self._interleaved_err_network_results.append(result.relpath)
+                    if result.checkout_error:
+                        errors.append(result.checkout_error)
                         self._interleaved_err_checkout = True
-                        self._interleaved_err_checkout_results.append(
-                            result.relpath
-                        )
+                        self._interleaved_err_checkout_results.append(result.relpath)
 
             if not ret and opt.fail_fast:
                 if pool:
@@ -2607,7 +2370,7 @@ later is required to fix a server side protocol bug.
         self._interleaved_err_checkout_results = []
 
         err_event = multiprocessing.Event()
-        finished_relpaths = set()
+        synced_relpaths = set()
         project_list = list(all_projects)
         pm = Progress(
             "Syncing",
@@ -2622,126 +2385,85 @@ later is required to fix a server side protocol bug.
         sync_event = _threading.Event()
         sync_progress_thread = self._CreateSyncProgressThread(pm, sync_event)
 
-        try:
-            with multiprocessing.Manager() as manager, ssh.ProxyManager(
-                manager
-            ) as ssh_proxy:
-                ssh_proxy.sock()
-                with self.ParallelContext():
-                    self.get_parallel_context()["ssh_proxy"] = ssh_proxy
-                    # TODO(gavinmak): Use multprocessing.Queue instead of dict.
-                    self.get_parallel_context()[
-                        "sync_dict"
-                    ] = multiprocessing.Manager().dict()
-                    sync_progress_thread.start()
+        with multiprocessing.Manager() as manager, ssh.ProxyManager(manager) as ssh_proxy:
+            ssh_proxy.sock()
+            with self.ParallelContext():
+                self.get_parallel_context()["ssh_proxy"] = ssh_proxy
+                # TODO(gavinmak): Use multprocessing.Queue instead of dict.
+                self.get_parallel_context()["sync_dict"] = multiprocessing.Manager().dict()
+                sync_progress_thread.start()
 
-                    try:
-                        # Outer loop for dynamic project discovery. This
-                        # continues until no unsynced projects remain.
-                        while True:
-                            projects_to_sync = [
-                                p
-                                for p in project_list
-                                if p.relpath not in finished_relpaths
-                            ]
-                            if not projects_to_sync:
-                                break
+                try:
+                    # Outer loop for dynamic project discovery. This continues
+                    # until no unsynced projects remain.
+                    while True:
+                        projects_to_sync = [p for p in project_list if p.relpath not in synced_relpaths]
+                        if not projects_to_sync:
+                            break
 
-                            pending_relpaths = {
-                                p.relpath for p in projects_to_sync
-                            }
-                            if previously_pending_relpaths == pending_relpaths:
-                                stalled_projects_str = "\n".join(
-                                    f" - {path}"
-                                    for path in sorted(list(pending_relpaths))
-                                )
-                                logger.error(
-                                    "The following projects failed and could "
-                                    "not be synced:\n%s",
-                                    stalled_projects_str,
-                                )
-                                err_event.set()
-                                break
-                            previously_pending_relpaths = pending_relpaths
+                        pending_relpaths = {p.relpath for p in projects_to_sync}
+                        if previously_pending_relpaths == pending_relpaths:
+                            logger.error("Stall detected in interleaved sync, not all " "projects could be synced.")
+                            err_event.set()
+                            break
+                        previously_pending_relpaths = pending_relpaths
 
-                            self.get_parallel_context()[
-                                "projects"
-                            ] = projects_to_sync
-                            project_index_map = {
-                                p: i for i, p in enumerate(projects_to_sync)
-                            }
+                        self.get_parallel_context()["projects"] = projects_to_sync
+                        project_index_map = {p: i for i, p in enumerate(projects_to_sync)}
 
-                            # Inner loop to process projects in a hierarchical
-                            # order. This iterates through levels of project
-                            # dependencies (e.g. 'foo' then 'foo/bar'). All
-                            # projects in one level can be processed in
-                            # parallel, but we must wait for a level to complete
-                            # before starting the next.
-                            for level_projects in _SafeCheckoutOrder(
-                                projects_to_sync
-                            ):
-                                if not level_projects:
-                                    continue
+                        # Inner loop to process projects in a hierarchical
+                        # order. This iterates through levels of project
+                        # dependencies (e.g. 'foo' then 'foo/bar'). All projects
+                        # in one level can be processed in parallel, but we must
+                        # wait for a level to complete before starting the next.
+                        for level_projects in _SafeCheckoutOrder(projects_to_sync):
+                            if not level_projects:
+                                continue
 
-                                objdir_project_map = collections.defaultdict(
-                                    list
-                                )
-                                for p in level_projects:
-                                    objdir_project_map[p.objdir].append(
-                                        project_index_map[p]
-                                    )
+                            objdir_project_map = collections.defaultdict(list)
+                            for p in level_projects:
+                                objdir_project_map[p.objdir].append(project_index_map[p])
 
-                                work_items = list(objdir_project_map.values())
-                                if not work_items:
-                                    continue
+                            work_items = list(objdir_project_map.values())
+                            if not work_items:
+                                continue
 
-                                jobs = max(1, min(opt.jobs, len(work_items)))
-                                callback = functools.partial(
-                                    self._ProcessSyncInterleavedResults,
-                                    finished_relpaths,
-                                    err_event,
-                                    errors,
-                                    opt,
-                                )
-                                if not self.ExecuteInParallel(
-                                    jobs,
-                                    functools.partial(
-                                        self._SyncProjectList, opt
-                                    ),
-                                    work_items,
-                                    callback=callback,
-                                    output=pm,
-                                    chunksize=1,
-                                    initializer=self.InitWorker,
-                                ):
-                                    err_event.set()
-
-                                if err_event.is_set() and opt.fail_fast:
-                                    raise SyncFailFastError(
-                                        aggregate_errors=errors
-                                    )
-
-                            self._ReloadManifest(None, manifest)
-                            project_list = self.GetProjects(
-                                args,
-                                missing_ok=True,
-                                submodules_ok=opt.fetch_submodules,
-                                manifest=manifest,
-                                all_manifests=not opt.this_manifest_only,
+                            jobs = max(1, min(opt.jobs, len(work_items)))
+                            callback = functools.partial(
+                                self._ProcessSyncInterleavedResults,
+                                synced_relpaths,
+                                err_event,
+                                errors,
+                                opt,
                             )
-                            pm.update_total(len(project_list))
-                    finally:
-                        sync_event.set()
-                        sync_progress_thread.join()
-        finally:
-            self._fetch_times.Save()
-            self._local_sync_state.Save()
+                            if not self.ExecuteInParallel(
+                                jobs,
+                                functools.partial(self._SyncProjectList, opt),
+                                work_items,
+                                callback=callback,
+                                output=pm,
+                                chunksize=1,
+                            ):
+                                err_event.set()
+
+                            if err_event.is_set() and opt.fail_fast:
+                                raise SyncFailFastError(aggregate_errors=errors)
+
+                        self._ReloadManifest(None, manifest)
+                        project_list = self.GetProjects(
+                            args,
+                            missing_ok=True,
+                            submodules_ok=opt.fetch_submodules,
+                            manifest=manifest,
+                            all_manifests=not opt.this_manifest_only,
+                        )
+                finally:
+                    sync_event.set()
+                    sync_progress_thread.join()
 
         pm.end()
 
-        err_update_projects, err_update_linkfiles = self._UpdateManifestLists(
-            opt, err_event, errors
-        )
+        err_update_projects, err_update_linkfiles = self._UpdateManifestLists(opt, err_event, errors)
         if not self.outer_client.manifest.IsArchive:
             self._GCProjects(project_list, opt, err_event)
 
@@ -2784,9 +2506,7 @@ def _PostRepoFetch(rp, repo_verify=True, verbose=False):
             rev = rp.bare_git.describe(rp.GetRevisionId())
         except GitError:
             rev = None
-        _, new_rev = wrapper.check_repo_rev(
-            rp.gitdir, rev, repo_verify=repo_verify
-        )
+        _, new_rev = wrapper.check_repo_rev(rp.gitdir, rev, repo_verify=repo_verify)
         # See if we're held back due to missing signed tag.
         current_revid = rp.bare_git.rev_parse("HEAD")
         new_revid = rp.bare_git.rev_parse("--verify", new_rev)
@@ -2839,19 +2559,17 @@ class _FetchTimes:
                 self._saved = {}
 
     def Save(self):
-        if not self._seen:
+        if self._saved is None:
             return
-
-        self._Load()
 
         for name, t in self._seen.items():
             # Keep a moving average across the previous/current sync runs.
             old = self._saved.get(name, t)
-            self._saved[name] = (self._ALPHA * t) + ((1 - self._ALPHA) * old)
+            self._seen[name] = (self._ALPHA * t) + ((1 - self._ALPHA) * old)
 
         try:
             with open(self._path, "w") as f:
-                json.dump(self._saved, f, indent=2)
+                json.dump(self._seen, f, indent=2)
         except (OSError, TypeError):
             platform_utils.remove(self._path, missing_ok=True)
 
@@ -2862,9 +2580,7 @@ class LocalSyncState:
 
     def __init__(self, manifest):
         self._manifest = manifest
-        self._path = os.path.join(
-            self._manifest.repodir, ".repo_localsyncstate.json"
-        )
+        self._path = os.path.join(self._manifest.repodir, ".repo_localsyncstate.json")
         self._time = time.time()
         self._state = None
         self._Load()
@@ -2985,13 +2701,9 @@ class PersistentTransport(xmlrpc.client.Transport):
 
             proxyhandler = urllib.request.ProxyHandler
             if proxy:
-                proxyhandler = urllib.request.ProxyHandler(
-                    {"http": proxy, "https": proxy}
-                )
+                proxyhandler = urllib.request.ProxyHandler({"http": proxy, "https": proxy})
 
-            opener = urllib.request.build_opener(
-                urllib.request.HTTPCookieProcessor(cookiejar), proxyhandler
-            )
+            opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(cookiejar), proxyhandler)
 
             url = urllib.parse.urljoin(self.orig_host, handler)
             parse_results = urllib.parse.urlparse(url)
